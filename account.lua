@@ -1,3 +1,9 @@
+-- Copyright (c) 2016 Kim Alvefur
+-- 
+-- This project is MIT/X11 licensed. Please see the
+-- COPYING file in the source package for more information.
+--
+
 local pkey = require "openssl.pkey";
 local json = require "cjson.safe";
 local jws = require "jws";
@@ -108,15 +114,18 @@ local function new(account_key, directory_url, https_request)
 
 		nonces = nonces;
 
+		-- low-level methods
 		signed_request = signed_request;
 		unsigned_request = request;
 		get_key_authz = get_key_authz;
 		get_directory = get_directory;
 		step = step;
 
+		-- high-level methods
 		register = register;
 		new_authz = new_authz;
 
+		-- even higher level
 		new_dns_authz = new_dns_authz;
 		poll_challenge = poll_challenge;
 	};

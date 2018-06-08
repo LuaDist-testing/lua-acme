@@ -1,4 +1,5 @@
 #!/usr/bin/env lua
+-- luacheck: ignore 421/err
 require "luarocks.loader";
 
 table.insert(package.loaders, 1, function (package)
@@ -14,6 +15,11 @@ table.insert(package.loaders, 1, function (package)
 	return code;
 end);
 
+local lfs = require "lfs";
+local pkey = require "openssl.pkey";
+local x509 = require "openssl.x509";
+local x509_name = require "openssl.x509.name";
+local x509_csr = require "_openssl.x509.csr";
 local acme = require "acme.account";
 local file = require "acme.datautil";
 local b64url = require "b64url".encode;
@@ -48,7 +54,7 @@ if command == "register" then
 
 	local key = file.load(key_file);
 	if not key then
-		key = require "openssl.pkey".new{ bits = 2^12 };
+		key = pkey.new{ bits = 2^12 };
 		file.save(key_file, key:toPEM("private"));
 	end
 
@@ -79,18 +85,18 @@ if not hosts then
 end
 
 for _, host in ipairs(arg) do
-	local data = hosts[host];
+	io.stderr:write("= ", host, " =\n");
+	local authz = hosts[host];
 
-	if data == nil then
+	if not authz then
 		local cert = file.load(host..".der");
 		if cert then
-			data.havecert = true;
-			cert = require "openssl.x509".new(cert, "DER");
+			cert = x509.new(cert, "DER");
 			local issued, expires = assert(cert:getLifetime());
 
-			print(os.date("Issued:  %F", issued));
-			print(os.date("Expires: %F", expires));
-			if os.time() + 86400 * 7 * 3 > expires then
+			if os.time() + (86400 * 7 * 3) > expires then
+				print(os.date("Issued:  %F", issued));
+				print(os.date("Expires: %F", expires));
 				print("Renewal time");
 				cert = false;
 			end
@@ -101,37 +107,44 @@ for _, host in ipairs(arg) do
 			local newdata, err = account.new_dns_authz(host);
 			if not newdata then
 				io.stderr:write(tostring(err), "\n");
-				return os.exit(1);
 			else
-				hosts[host], data = newdata, newdata;
+				hosts[host], authz = newdata, newdata;
 			end
 		end
-	elseif data.body.status == "pending" then
-		local updated, err = account.unsigned_request(data.head.location or data.url);
-		if not updated then
-			io.stderr:write("Failed to update authz: ",tostring(err), "\n");
-		else
-			hosts[host], data = updated, updated;
-		end
+	else
+		authz.need_update = true;
 	end
 
-	if data.body.status == "pending" then
-		for i, challenge in ipairs(data.body.challenges) do
-			if not challenge.keyAuthorization then
-				if challenge.status == "pending" then
-					local updated_challenge, err = account.unsigned_request(challenge.uri);
-					if updated_challenge then
-						data.body.challenges[i] = updated_challenge.body;
-						challenge = updated_challenge.body;
-					else
-						io.stderr:write("Failed to poll challenge: ",tostring(err), "\n");
-					end
+	if authz then
+		while authz.body.status == "pending" do
+			if authz.need_update then
+				io.stderr:write("Updating authz...\n");
+				local updated, err = account.unsigned_request(authz.head.location or authz.url);
+				if not updated then
+					io.stderr:write("Failed to update authz: ", tostring(err), "\n");
+					break;
+				else
+					hosts[host], authz = updated, updated;
 				end
-				if challenge.status == "pending" then
+			end
+
+			for i, challenge in ipairs(authz.body.challenges) do
+				local challenge_supported, challenge_test = pcall(require, "acme.challenge."..challenge.type);
+				if challenge_supported and challenge.type == "http-01" then
 					local key_authz = account.get_key_authz(challenge.token);
-					local challenge_supported, challenge_test = pcall(require, "acme.challenge."..challenge.type);
-					if challenge_supported then
+					if challenge.type == "http-01" then
+						local fh = io.open("/var/www/"..host.."/.well-known/acme-challenge/"..challenge.token, "w");
+						if fh then
+							fh:write(key_authz);
+							fh:close();
+							os.execute("chmod a+r /var/www/"..host.."/.well-known/acme-challenge/"..challenge.token);
+						end
+					end
+
+					while challenge.status == "pending" and not challenge.keyAuthorization do
+						io.stderr:write("Checking ", challenge.type, " challenge...\n");
 						if challenge_test.verify(account, host, challenge.token) then
+							io.stderr:write("Polling ", challenge.type, " challenge...\n");
 							local poll, err = account.step({
 								resource = "challenge",
 								type = challenge.type,
@@ -139,40 +152,117 @@ for _, host in ipairs(arg) do
 							}, challenge.uri);
 							if not poll then
 								io.stderr:write(tostring(err), "\n");
-								-- return os.exit(1);
+								authz.need_update = true;
+								break;
 							else
-								data.body.challenges[i] = poll.body;
+								if challenge.status ~= poll.body.status then
+									authz.need_update = true;
+								end
+								authz.body.challenges[i] = poll.body;
+								challenge = poll.body;
 							end
 						else
 							print("Incomplete ".. challenge.type.." challenge:");
 							challenge_test.describe(account, host, challenge.token);
-							print();
+							assert(file.savejson(account_file, account_data));
+							print("Complete this challenge and run this again");
+							os.exit();
 						end
-						-- else
-						-- io.stderr:write(challenge_test, "\n");
 					end
+
+					while challenge.keyAuthorization and challenge.status == "pending" do
+						require "socket".sleep(1);
+						local updated_challenge, err = account.unsigned_request(challenge.uri);
+						if updated_challenge then
+							authz.body.challenges[i] = updated_challenge.body;
+							challenge = updated_challenge.body;
+							if challenge.status ~= "pending" then
+								authz.need_update = true;
+							end
+						else
+							io.stderr:write("Failed to poll challenge: ", tostring(err), "\n");
+							break;
+						end
+					end
+
+					if not authz.combinations then
+						break;
+					end
+					local allvalid = false;
+					for i, combo in ipairs(authz.combinations) do
+						allvalid = true;
+						for i, challenge_id in ipairs(combo) do
+							-- 0-based indexing... silly JSON
+							if authz.challenges[challenge_id+1].status ~= "valid" then
+								allvalid = false;
+								break;
+							end
+						end
+					end
+					if allvalid then break end
 				end
+			end
+
+			assert(file.savejson(account_file, account_data));
+		end
+
+		if authz.body.status == "valid" then
+			io.stderr:write("Authorized, preparing CSR...\n");
+			local csr = file.load(host..".csr");
+			if csr then
+				csr = x509_csr.new(csr);
+			else
+				csr = x509_csr.new();
+
+				local name = x509_name.new();
+				name:add("CN", host);
+				csr:setSubject(name);
+
+				local key = file.load(host..".key");
+				if key then
+					key = pkey.new(key);
+				else
+					io.stderr:write("Generating new RSA key...\n");
+					key = pkey.new({ bits = 2^12 });
+					file.save(host..".key", key:toPEM("private"));
 				end
+				csr:setPublicKey(key);
+				csr:sign(key);
+
+				file.save(host..".pub", key:toPEM("public"));
+				file.save(host..".csr", csr:tostring());
+			end
+
+			local cert, err = account.step({
+				resource = "new-cert",
+				csr = b64url(csr:tostring("DER")),
+			});
+
+			if cert then
+				if cert.head["content-type"] == "application/pkix-cert" then
+					file.save(host..".der", cert.body);
+					local pem_crt = tostring(x509.new(cert.body, "DER"));
+					for link, rel in string.gmatch(cert.head.link or "", "<(.-)>;rel=\"(.-)\"") do
+						if rel == "up" then
+							local up = account.unsigned_request(link);
+							if up then
+								pem_crt = pem_crt .. tostring(x509.new(up.body, "DER"));
+							end
+						end
+					end
+					if lfs.attributes(host..".crt", "mode") then
+						os.rename(host..".crt", host..".crt.old");
+					end
+					file.save(host..".crt", pem_crt);
+					cert.body = nil;
+				end
+				hosts[host] = nil;
+				file.savejson(host..".json", cert);
+			else
+				io.stderr:write("Error requesting certificate: ", tostring(err), "\n");
 			end
 		end
 	end
-
-	if data.body.status == "valid" then
-		local gencsr = io.popen("/usr/bin/openssl req -batch -new -newkey rsa:2048 -nodes -keyout "..host..".key -subj /CN="..host.." -outform der");
-		local csr = gencsr:read("*a");
-		local cert, err = account.step({
-			resource = "new-cert",
-			csr = b64url(csr),
-		});
-		if cert and cert.head["content-type"] == "application/pkix-cert" then
-			file.save(host..".der", cert.body);
-			cert.body = b64url(cert.body);
-			hosts[host] = nil;
-			file.savejson(host..".json", cert);
-			data.havecert = cert;
-			data.timestamp = os.time();
-		end
-	end
+	assert(file.savejson(account_file, account_data));
 end
 
-assert(file.savejson(account_file, account_data));

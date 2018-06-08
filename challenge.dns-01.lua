@@ -1,3 +1,9 @@
+-- Copyright (c) 2016 Kim Alvefur
+-- 
+-- This project is MIT/X11 licensed. Please see the
+-- COPYING file in the source package for more information.
+--
+
 local digest = require "openssl.digest";
 local b64url = require "b64url".encode;
 
@@ -29,4 +35,5 @@ end
 return {
 	verify = verify;
 	describe = describe;
+	getcontent = preptoken;
 }

@@ -1,0 +1,175 @@
+#!/usr/bin/env lua
+require "luarocks.loader";
+
+table.insert(package.loaders, 1, function (package)
+	if package:sub(1, 5) ~= "acme." then
+		return ("'%s' does not contain prefix 'acme.'"):format(package);
+	end
+	local fh, err = io.open("./"..package:sub(6)..".lua");
+	if not fh then return err; end
+	local code = fh:read("*a");
+	fh:close();
+	code, err = loadstring(code);
+	if not code then return err; end
+	return code;
+end);
+
+local acme = require "acme.account";
+local file = require "acme.datautil";
+local b64url = require "b64url".encode;
+local unpack = table.unpack or unpack;
+
+local account_file = table.remove(arg, 1);
+local command = table.remove(arg, 1);
+
+if command ~= "register" and command ~= "getcert" then
+	command = false;
+end
+
+if not account_file or not command then
+	io.stderr:write("Syntax: ", arg[0], " account.json command ...\n");
+	io.stderr:write("commands:\n");
+	io.stderr:write("  register https://acme.example/directory mailto:acme-admin@example.com\n");
+	io.stderr:write("  getcert example.com www.example.com ...\n");
+	return os.exit(1);
+end
+
+local account_data = file.loadjson(account_file);
+local key_file = account_file:gsub("%.json$", "") .. ".key";
+
+local account;
+
+if command == "register" then
+	if account_data then
+		io.stderr:write("Account already exists, refusing to overwrite it\n");
+		os.exit(1);
+	end
+	account_data = {};
+
+	local key = file.load(key_file);
+	if not key then
+		key = require "openssl.pkey".new{ bits = 2^12 };
+		file.save(key_file, key:toPEM("private"));
+	end
+
+	local directory_url;
+	if arg[1] and arg[1]:match("^https://") then
+		directory_url = table.remove(arg, 1);
+		account_data.directory_url = directory_url;
+	end
+	account = assert(acme.new(key, directory_url));
+	local reg, err = account.register(unpack(arg));
+	if not reg then
+		_G.Account = account;
+		print(err);
+		debug.debug();
+	else
+		account_data.reg = reg;
+	end
+	file.savejson(account_file, account_data);
+	return os.exit(0);
+end
+
+account = assert(acme.new(assert(file.load(key_file)), account_data.directory_url));
+
+local hosts = account_data.hosts;
+if not hosts then
+	hosts = {};
+	account_data.hosts = hosts;
+end
+
+for _, host in ipairs(arg) do
+	local data = hosts[host];
+
+	if data == nil then
+		local cert = file.load(host..".der");
+		if cert then
+			data.havecert = true;
+			cert = require "openssl.x509".new(cert, "DER");
+			local issued, expires = assert(cert:getLifetime());
+
+			print(os.date("Issued:  %F", issued));
+			print(os.date("Expires: %F", expires));
+			if os.time() + 86400 * 7 * 3 > expires then
+				print("Renewal time");
+				cert = false;
+			end
+		end
+
+		if not cert then
+			-- Create new authz request
+			local newdata, err = account.new_dns_authz(host);
+			if not newdata then
+				io.stderr:write(tostring(err), "\n");
+				return os.exit(1);
+			else
+				hosts[host], data = newdata, newdata;
+			end
+		end
+	elseif data.body.status == "pending" then
+		local updated, err = account.unsigned_request(data.head.location);
+		if not updated then
+			io.stderr:write("Failed to update authz: ",tostring(err), "\n");
+		else
+			hosts[host], data = updated, updated;
+		end
+	end
+
+	if data.body.status == "pending" then
+		for i, challenge in ipairs(data.body.challenges) do
+			if challenge.status == "pending" then
+				local updated_challenge, err = account.unsigned_request(challenge.uri);
+				if updated_challenge then
+					data.body.challenges[i] = updated_challenge.body;
+					challenge = updated_challenge.body;
+				else
+					io.stderr:write("Failed to poll challenge: ",tostring(err), "\n");
+				end
+			end
+			if challenge.status == "pending" then
+				local key_authz = account.get_key_authz(challenge.token);
+				local challenge_supported, challenge_test = pcall(require, "acme.challenge."..challenge.type);
+				if challenge_supported then
+					if challenge_test.verify(account, host, challenge.token) then
+						local poll, err = account.step({
+							resource = "challenge",
+							type = challenge.type,
+							keyAuthorization = key_authz,
+						}, challenge.uri);
+						if not poll then
+							io.stderr:write(tostring(err), "\n");
+							-- return os.exit(1);
+						else
+							data.body.challenges[i] = poll.body;
+						end
+					else
+						print("Incomplete ".. challenge.type.." challenge:");
+						challenge_test.describe(account, host, challenge.token);
+						print();
+					end
+				-- else
+					-- io.stderr:write(challenge_test, "\n");
+				end
+			end
+		end
+	end
+	
+	if data.body.status == "valid" then
+		local gencsr = io.popen("/usr/bin/openssl req -batch -new -newkey rsa:2048 -nodes -keyout "..host..".key -subj /CN="..host.." -outform der");
+		local csr = gencsr:read("*a");
+		local cert, err = account.step({
+			resource = "new-cert",
+			csr = b64url(csr),
+		});
+		if cert and cert.head["content-type"] == "application/pkix-cert" then
+			cert.body = b64url(cert.body);
+			hosts[host] = nil;
+			file.savejson(host..".json", cert);
+			file.save(host..".der", cert.body);
+			data.havecert = cert;
+			data.timestamp = os.time();
+		end
+	end
+end
+
+assert(file.savejson(account_file, account_data));

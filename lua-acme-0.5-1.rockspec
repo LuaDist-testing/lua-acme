@@ -1,16 +1,16 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "lua-acme"
-version = "0.4-1"
+version = "0.5-1"
 -- LuaDist source
 source = {
-  tag = "0.4-1",
+  tag = "0.5-1",
   url = "git://github.com/LuaDist-testing/lua-acme.git"
 }
 -- Original source
 -- source = {
 -- 	url = "hg+http://code.zash.se/lua-acme",
--- 	tag = "0.4"
+-- 	tag = "0.5"
 -- }
 description = {
 	homepage = "http://code.zash.se/lua-acme",

@@ -107,7 +107,7 @@ for _, host in ipairs(arg) do
 			end
 		end
 	elseif data.body.status == "pending" then
-		local updated, err = account.unsigned_request(data.head.location);
+		local updated, err = account.unsigned_request(data.head.location or data.url);
 		if not updated then
 			io.stderr:write("Failed to update authz: ",tostring(err), "\n");
 		else
@@ -117,43 +117,46 @@ for _, host in ipairs(arg) do
 
 	if data.body.status == "pending" then
 		for i, challenge in ipairs(data.body.challenges) do
-			if challenge.status == "pending" then
-				local updated_challenge, err = account.unsigned_request(challenge.uri);
-				if updated_challenge then
-					data.body.challenges[i] = updated_challenge.body;
-					challenge = updated_challenge.body;
-				else
-					io.stderr:write("Failed to poll challenge: ",tostring(err), "\n");
-				end
-			end
-			if challenge.status == "pending" then
-				local key_authz = account.get_key_authz(challenge.token);
-				local challenge_supported, challenge_test = pcall(require, "acme.challenge."..challenge.type);
-				if challenge_supported then
-					if challenge_test.verify(account, host, challenge.token) then
-						local poll, err = account.step({
-							resource = "challenge",
-							type = challenge.type,
-							keyAuthorization = key_authz,
-						}, challenge.uri);
-						if not poll then
-							io.stderr:write(tostring(err), "\n");
-							-- return os.exit(1);
-						else
-							data.body.challenges[i] = poll.body;
-						end
+			if not challenge.keyAuthorization then
+				if challenge.status == "pending" then
+					local updated_challenge, err = account.unsigned_request(challenge.uri);
+					if updated_challenge then
+						data.body.challenges[i] = updated_challenge.body;
+						challenge = updated_challenge.body;
 					else
-						print("Incomplete ".. challenge.type.." challenge:");
-						challenge_test.describe(account, host, challenge.token);
-						print();
+						io.stderr:write("Failed to poll challenge: ",tostring(err), "\n");
 					end
-				-- else
-					-- io.stderr:write(challenge_test, "\n");
+				end
+				if challenge.status == "pending" then
+					local key_authz = account.get_key_authz(challenge.token);
+					local challenge_supported, challenge_test = pcall(require, "acme.challenge."..challenge.type);
+					if challenge_supported then
+						if challenge_test.verify(account, host, challenge.token) then
+							local poll, err = account.step({
+								resource = "challenge",
+								type = challenge.type,
+								keyAuthorization = key_authz,
+							}, challenge.uri);
+							if not poll then
+								io.stderr:write(tostring(err), "\n");
+								-- return os.exit(1);
+							else
+								data.body.challenges[i] = poll.body;
+							end
+						else
+							print("Incomplete ".. challenge.type.." challenge:");
+							challenge_test.describe(account, host, challenge.token);
+							print();
+						end
+						-- else
+						-- io.stderr:write(challenge_test, "\n");
+					end
+				end
 				end
 			end
 		end
 	end
-	
+
 	if data.body.status == "valid" then
 		local gencsr = io.popen("/usr/bin/openssl req -batch -new -newkey rsa:2048 -nodes -keyout "..host..".key -subj /CN="..host.." -outform der");
 		local csr = gencsr:read("*a");
@@ -162,10 +165,10 @@ for _, host in ipairs(arg) do
 			csr = b64url(csr),
 		});
 		if cert and cert.head["content-type"] == "application/pkix-cert" then
+			file.save(host..".der", cert.body);
 			cert.body = b64url(cert.body);
 			hosts[host] = nil;
 			file.savejson(host..".json", cert);
-			file.save(host..".der", cert.body);
 			data.havecert = cert;
 			data.timestamp = os.time();
 		end

@@ -1,10 +1,10 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "lua-acme"
-version = "0.6-1"
+version = "0.6-2"
 -- LuaDist source
 source = {
-  tag = "0.6-1",
+  tag = "0.6-2",
   url = "git://github.com/LuaDist-testing/lua-acme.git"
 }
 -- Original source
@@ -17,7 +17,7 @@ description = {
 	license = "MIT"
 }
 dependencies = {
-	"lua-jwc",
+	"lua-jwc == 0.2",
 	"luasocket",
 	"luaossl",
 	"lua-cjson",
